@@ -1,151 +1,128 @@
 # nav2_loopback_sim
 
-当前工作区中的轻量软件闭环仿真层。
+不依赖物理引擎的轻量 ROS 2 闭环模拟器，用速度积分生成 odom/TF/简化激光，
+用于行为树与 Nav2 对照链的快速回归。
 
-本包当前作用不是物理仿真，而是：
+> 仓库路径是 `src/sim/loopback_sim`，ROS 包名仍是 `nav2_loopback_sim`。
+> 它不是 P2 ROGMap、P3 Nav2-free 或 P4 舵轮动力学的验收环境。
 
-1. 接收 `/cmd_vel`
-2. 积分生成 `/odom`
-3. 维护最小必要 TF 链
-4. 发布 `/scan`
-5. 发布 `/clock`
-6. 让 Nav2 与行为树在无实车条件下仍能形成完整闭环
+## 目录
 
-## 当前入口
+- [功能模块](#功能模块)
+- [依赖](#依赖)
+- [Quick Start](#quick-start)
+- [启动入口](#启动入口)
+- [接口](#接口)
+- [配置与数据流](#配置与数据流)
+- [测试边界](#测试边界)
+- [参考与致谢](#参考与致谢)
 
-通常不直接单独启动本包，而是通过：
+## 功能模块
 
-- [../ats_sentry_bringup/launch/loopback_decision_sim.launch.py](../ats_sentry_bringup/launch/loopback_decision_sim.launch.py)
-- [../ats_sentry_bringup/launch/loopback_vision_test.launch.py](../ats_sentry_bringup/launch/loopback_vision_test.launch.py)
-- [../ats_sentry_bringup/launch/loopback_nav_only.launch.py](../ats_sentry_bringup/launch/loopback_nav_only.launch.py)
+| 功能 | 说明 |
+| :--- | :--- |
+| 位姿闭环 | 对输入 `Twist` 做平面运动学积分 |
+| 仿真时钟 | 可发布 `/clock` 驱动 `use_sim_time` 节点 |
+| TF/odom | 发布导航所需的简化位姿链 |
+| 简化激光 | 为 Nav2 costmap 提供基础障碍输入 |
+| 重定位注入 | 快速检查路径重算与行为状态变化 |
 
-仿真器本体：
+不包含接触、轮胎侧滑、四舵轮执行器、真实 LiDAR 扫描或 ROGMap 3D ESDF。
 
-- [nav2_loopback_sim/loopback_simulator.py](./nav2_loopback_sim/loopback_simulator.py)
+## 依赖
 
-默认参数：
+- ROS 2 Humble
+- `rclpy`、`geometry_msgs`、`nav_msgs`、`tf2_ros`
+- `tf_transformations`/`transforms3d`
+- 完整对照链还依赖 `ats_sentry_bringup`、`ats_sentry_behavior` 和 Nav2
 
-- [params/nav2_params.yaml](./params/nav2_params.yaml)
+## Quick Start
 
-## 当前闭环结构
+```bash
+cd /home/ats/ATS_2026_snetry_test
+source /opt/ros/humble/setup.bash
+colcon build --base-paths src \
+  --packages-select nav2_loopback_sim \
+  --symlink-install
+source install/setup.bash
+```
+
+## 启动入口
+
+### 通用决策回归
+
+```bash
+ros2 launch ats_sentry_bringup loopback_decision_sim.launch.py
+```
+
+### 视觉接管专项
+
+```bash
+ros2 launch ats_sentry_bringup loopback_vision_test.launch.py
+```
+
+### 只观察导航
+
+```bash
+ros2 launch ats_sentry_bringup loopback_nav_only.launch.py
+```
+
+包内入口包括 `launch/bringup_launch.py`、
+`launch/loopback_simulation.launch.py` 和
+`launch/tb3_loopback_simulation_launch.py`。正常项目回归优先使用根仓编排入口，
+避免漏启动行为参数或速度变换链。
+
+## 接口
+
+| Topic/TF | 方向 | 说明 |
+| :--- | :--- | :--- |
+| Nav2 command topic | 输入 | 由根 launch remap 决定 |
+| odom | 输出 | 积分位姿和速度 |
+| `/clock` | 输出 | 可选仿真时钟 |
+| scan | 输出 | 简化 2D 激光 |
+| TF | 输出 | map/odom/base 的测试链 |
+
+实际 topic 名以 launch remap 和 `params/nav2_params.yaml` 为准。不要把 loopback
+topic 存在推断为实机 frame/QoS/timeout 契约已通过。
+
+## 配置与数据流
+
+主配置：`params/nav2_params.yaml`。它服务于 loopback Nav2 对照链，不是实机
+总参数，也不应复制 ROGMap/MINCO/MPC 实机参数。
 
 ```text
-fake_decision_sim_inputs.py
-  -> initialpose
-  -> decision/sim_mode
-  -> referee/*
-  -> vision/target
-
-ats_sentry_behavior
-  -> /navigate_through_poses
-  -> decision/robot_mode
-  -> cmd_spin
-
-Nav2
-  -> planner / smoother / MPPI / governor / velocity_smoother
-  -> cmd_vel_nav2_result
-
-fake_vel_transform
-  -> cmd_spin + cmd_vel_nav2_result
-  -> /cmd_vel
-
-nav2_loopback_sim
-  -> /odom
-  -> TF
-  -> /scan
-  -> /clock
+behavior/Nav2 goal
+  -> Nav2 planner/controller
+  -> cmd_vel compatibility chain
+  -> nav2_loopback_sim
+  -> integrated odom + TF + scan
+  -> Nav2/behavior feedback
 ```
 
-## 当前功能
+## 测试边界
 
-### 1. 位姿闭环
+适合验证：
 
-当前 loopback 会维护最小必要坐标链：
+- 行为树 XML 是否能执行；
+- Nav2 action 是否发送、取消和结束；
+- 参数解析、remap、基础 TF 和 topic 接线；
+- 视觉接管的目标选择与滞回。
 
-```text
-map -> odom -> base_footprint -> base_link -> base_scan
-```
+不适合证明：
 
-### 2. 仿真时钟
+- ROGMap projection/ESDF 数值正确性；
+- MINCO immutable snapshot 和故障租约；
+- 四舵轮动力学、跟踪误差、制动距离；
+- 物理碰撞或实车性能。
 
-当前持续发布：
+- **已验证**：README 中包名、入口和依赖由 package/launch 静态核对。
+- **未验证**：本轮未启动 loopback。
+- **未完成**：本包无 Nav2-free action/MINCO/MPC 验收职责，相关工作在 MuJoCo 和实机链完成。
 
-- `/clock`
+工作区级说明见
+[仿真域说明](../../../docs/仿真域说明.md)。
 
-因此所有 `use_sim_time=True` 的节点都能在 loopback 下正常运行。
+## 参考与致谢
 
-### 3. 简化激光
-
-当前会基于静态地图生成：
-
-- `/scan`
-
-它不是高保真物理雷达，但足以驱动 Nav2 的 local/global costmap。
-
-### 4. 重定位测试
-
-支持运行中重发：
-
-- `/initialpose`
-
-用于验证：
-
-1. 行为树当前位姿更新
-2. Nav2 重定位后的路径更新
-3. 视觉跟随点是否重新选择
-
-## 当前推荐命令
-
-### 通用决策仿真
-
-```bash
-source install/setup.bash
-ros2 launch ats_sentry_bringup loopback_decision_sim.launch.py use_rviz:=True
-```
-
-### 视觉接管专测
-
-```bash
-source install/setup.bash
-ros2 launch ats_sentry_bringup loopback_vision_test.launch.py \
-  use_rviz:=True \
-  publish_referee_inputs:=True \
-  current_hp:=400 \
-  projectile_allowance_17mm:=200 \
-  publish_vision_target:=True \
-  vision_tracking:=True \
-  vision_nav_hold:=True \
-  vision_has_target_position_map:=True \
-  vision_target_position_map_frame:=map \
-  vision_target_position_map_x:=5.0 \
-  vision_target_position_map_y:=2.0 \
-  vision_target_position_map_z:=0.0 \
-  vision_target_yaw:=0.30 \
-  vision_target_pitch:=-0.06
-```
-
-### 纯导航观察
-
-```bash
-source install/setup.bash
-ros2 launch ats_sentry_bringup loopback_nav_only.launch.py use_rviz:=True
-```
-
-## 当前注意事项
-
-1. 不要在同一 `ROS_DOMAIN_ID` 中同时运行多套 loopback 或其他 `/clock` 发布者
-2. 当前工作区 loopback 常规调试默认使用 `ROS_DOMAIN_ID=90` 的环境 hook；若行为异常，先确认终端环境是否来自当前工作区 `install/setup.bash`
-3. 若 `ros2 param set` 卡住，可优先尝试 `--no-daemon`
-
-## 当前维护边界
-
-1. 调仿真器自身 `/odom`、TF、`/scan` 生成逻辑，在本包改
-2. 调行为树决策、视觉接管，不在本包改，去 `ats_sentry_behavior`
-3. 调 Nav2、MPPI、平滑、恢复行为，不在本包改，去 `ats_sentry_nav`
-4. 调假输入参数与组合 launch，不在本包改，去 `ats_sentry_bringup`
-
-## 相关文档
-
-- [../../docs/总览.md](../../docs/总览.md)
-- [../../docs/视觉跟随仿真调试.md](../../docs/视觉跟随仿真调试.md)
-- [../../docs/slim_loopback_refactor.md](../../docs/slim_loopback_refactor.md)
+本包用于 ROS 2/Nav2 兼容链的轻量回归。上游 API 和许可证以 ROS 2、Nav2 及仓内
+package 声明为准。
