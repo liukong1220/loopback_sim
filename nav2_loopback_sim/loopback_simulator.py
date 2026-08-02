@@ -4,9 +4,7 @@ from typing import Optional
 
 from geometry_msgs.msg import (PoseWithCovarianceStamped, Quaternion, TransformStamped, Twist,
                                TwistStamped, Vector3)
-from nav2_simple_commander.line_iterator import LineIterator
-from nav_msgs.msg import Odometry
-from nav_msgs.srv import GetMap
+from nav_msgs.msg import OccupancyGrid, Odometry
 import numpy as np
 import rclpy
 from rclpy.duration import Duration
@@ -40,6 +38,7 @@ if not hasattr(np, 'maximum_sctype'):
 
     np.maximum_sctype = _maximum_sctype  # type: ignore[attr-defined]
 
+from .grid_ray import iter_grid_ray
 from .utils import (addYawToQuat, getMapOccupancy, matrixToTransform, transformStampedToMatrix,
                     worldToMap)
 from .tf_compat import tf_transformations
@@ -75,8 +74,8 @@ class LoopbackSimulator(Node):
         self.declare_parameter('base_frame_id', 'base_footprint')
         self.base_frame_id = self.get_parameter('base_frame_id').get_parameter_value().string_value
 
-        # loopback 导航主底盘坐标默认使用 base_footprint，但上层仍有一部分节点、
-        # 可视化与调试工具会继续查询 base_link / base_scan。
+        # loopback 导航主底盘坐标默认使用 base_footprint；为与 ATS 诊断工具
+        # 对齐，也持续提供 base_link / base_scan。
         # 因此这里额外维护一条同拍、同时间戳的辅助 TF 链：
         # base_footprint -> base_link -> base_scan
         # 这样能避免外部静态 TF 在 sim_time 下被晚收到或未连通时，
@@ -84,9 +83,8 @@ class LoopbackSimulator(Node):
         self.declare_parameter('body_frame_id', 'base_link')
         self.body_frame_id = self.get_parameter('body_frame_id').get_parameter_value().string_value
 
-        # 实车链里不少节点会查询 gimbal_yaw_fake 作为“导航主底盘”坐标系。
-        # loopback 没有真实云台链路时，也持续补一条 base_footprint -> gimbal_yaw_fake
-        # 的辅助 TF，避免 recovery / behavior / RViz 因 frame 缺失直接失败。
+        # loopback 没有真实云台链路，因此只提供一条 base_footprint ->
+        # gimbal_yaw_fake 兼容 TF，供 ATS 规划 frame 查询使用。
         self.declare_parameter('auxiliary_frame_id', 'gimbal_yaw_fake')
         self.auxiliary_frame_id = self.get_parameter(
             'auxiliary_frame_id').get_parameter_value().string_value
@@ -99,6 +97,12 @@ class LoopbackSimulator(Node):
 
         self.declare_parameter('scan_frame_id', 'base_scan')
         self.scan_frame_id = self.get_parameter('scan_frame_id').get_parameter_value().string_value
+
+        self.declare_parameter('command_topic', '/motion_control')
+        self.command_topic = self.get_parameter('command_topic').get_parameter_value().string_value
+
+        self.declare_parameter('map_topic', '/map')
+        self.map_topic = self.get_parameter('map_topic').get_parameter_value().string_value
 
         self.declare_parameter('enable_stamped_cmd_vel', True)
         use_stamped = self.get_parameter('enable_stamped_cmd_vel').get_parameter_value().bool_value
@@ -182,11 +186,11 @@ class LoopbackSimulator(Node):
         if not use_stamped:
             self.cmd_vel_sub = self.create_subscription(
                 Twist,
-                'cmd_vel', self.cmdVelCallback, 10)
+                self.command_topic, self.cmdVelCallback, 10)
         else:
             self.cmd_vel_sub = self.create_subscription(
                 TwistStamped,
-                'cmd_vel', self.cmdVelStampedCallback, 10)
+                self.command_topic, self.cmdVelStampedCallback, 10)
         self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
 
         sensor_qos = QoSProfile(
@@ -195,17 +199,20 @@ class LoopbackSimulator(Node):
             depth=10)
         self.scan_pub = self.create_publisher(LaserScan, 'scan', sensor_qos)
 
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1)
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, self.map_topic, self.mapCallback, map_qos)
+
         if self.publish_clock:
             self.clock_pub = self.create_publisher(Clock, '/clock', 10)
 
         self.setupTimer = self.create_timer(0.1, self.setupTimerCallback)
 
-        self.map_client = self.create_client(GetMap, '/map_server/map')
-
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.getMap()
 
         self.info('Loopback simulator initialized')
 
@@ -223,7 +230,7 @@ class LoopbackSimulator(Node):
 
     def setupTimerCallback(self) -> None:
         # 在 initialpose 之前也持续发布一套完整的动态 TF/odom，
-        # 让 Nav2 / RViz / message filter 提前建立稳定缓存，避免
+        # 让 RViz / message filter 提前建立稳定缓存，避免
         # 首次收到 initialpose 或 scan 时出现“frame 不连通 / 时间早于缓存”的抖动。
         stamp = self.makeStepStamp()
         self.publishClock(stamp)
@@ -420,26 +427,11 @@ class LoopbackSimulator(Node):
         self.get_logger().debug(msg)
         return
 
-    def getMap(self) -> None:
-        request = GetMap.Request()
-        if self.map_client.wait_for_service(timeout_sec=5.0):
-            # Request to get map
-            future = self.map_client.call_async(request)
-            rclpy.spin_until_future_complete(self, future)
-            result = future.result()
-            if result is not None:
-                self.map = result.map
-                self.get_logger().info('Laser scan will be populated using map data')
-            else:
-                self.get_logger().warn(
-                    'Failed to get map, '
-                    'Laser scan will be populated using max range'
-                )
-        else:
-            self.get_logger().warn(
-                'Failed to get map, '
-                'Laser scan will be populated using max range'
-            )
+    def mapCallback(self, message: OccupancyGrid) -> None:
+        self.map = message
+        self.get_logger().info(
+            'Received static map %dx%d at %.3f m/cell from %s',
+            message.info.width, message.info.height, message.info.resolution, self.map_topic)
 
     def getLaserPose(self) -> tuple[float, float, float]:
         mat_map_to_odom = transformStampedToMatrix(self.t_map_to_odom)
@@ -490,10 +482,7 @@ class LoopbackSimulator(Node):
 
             mx1, my1 = worldToMap(x1, y1, self.map)
 
-            line_iterator = LineIterator(mx0, my0, mx1, my1, 0.5)
-
-            while line_iterator.isValid():
-                mx, my = int(line_iterator.getX()), int(line_iterator.getY())
+            for mx, my in iter_grid_ray(mx0, my0, mx1, my1):
 
                 if not 0 < mx < self.map.info.width or not 0 < my < self.map.info.height:
                     # if outside map then check next ray
@@ -502,13 +491,8 @@ class LoopbackSimulator(Node):
                 point_cost = getMapOccupancy(mx, my, self.map)
 
                 if point_cost >= 60:
-                    self.scan_msg.ranges[i] = math.sqrt(
-                        (int(line_iterator.getX()) - mx0) ** 2 +
-                        (int(line_iterator.getY()) - my0) ** 2
-                    ) * self.map.info.resolution
+                    self.scan_msg.ranges[i] = math.hypot(mx - mx0, my - my0) * self.map.info.resolution
                     break
-
-                line_iterator.advance()
             if self.scan_msg.ranges[i] == 0.0 and self.use_inf:
                 self.scan_msg.ranges[i] = float('inf')
 

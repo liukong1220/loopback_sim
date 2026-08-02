@@ -9,13 +9,12 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    params_file = LaunchConfiguration('params_file')
-    declare_params_file_cmd = DeclareLaunchArgument(
-        'params_file',
-        default_value=os.path.join(
-            get_package_share_directory('nav2_loopback_sim'), 'nav2_params.yaml'
-        ),
-        description='Full path to the ROS2 parameters file to use for all launched nodes',
+    loopback_dir = get_package_share_directory('nav2_loopback_sim')
+    map_yaml_file = LaunchConfiguration('map')
+    declare_map_cmd = DeclareLaunchArgument(
+        'map',
+        default_value=os.path.join(loopback_dir, 'maps', 'warehouse.yaml'),
+        description='Static occupancy-grid YAML published on /map.',
     )
 
     scan_frame_id = LaunchConfiguration('scan_frame_id')
@@ -29,14 +28,27 @@ def generate_launch_description() -> LaunchDescription:
         executable='loopback_simulator',
         name='loopback_simulator',
         output='screen',
-        parameters=[params_file, {'scan_frame_id': scan_frame_id}],
-        remappings=[
-            ('cmd_vel', 'cmd_vel_nav2_result'),
-        ],
+        parameters=[{
+            'scan_frame_id': scan_frame_id,
+            'command_topic': '/motion_control',
+            'map_topic': '/map',
+        }],
+    )
+    static_map = Node(
+        package='ats_nav_bringup',
+        executable='static_map_publisher.py',
+        name='static_map_publisher',
+        output='screen',
+        parameters=[{
+            'map_yaml_file': map_yaml_file,
+            'map_topic': '/map',
+            'frame_id': 'map',
+        }],
     )
 
     ld = LaunchDescription()
     ld.add_action(declare_scan_frame_id_cmd)
-    ld.add_action(declare_params_file_cmd)
+    ld.add_action(declare_map_cmd)
+    ld.add_action(static_map)
     ld.add_action(loopback_sim_cmd)
     return ld
