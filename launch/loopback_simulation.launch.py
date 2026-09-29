@@ -23,6 +23,22 @@ def generate_launch_description() -> LaunchDescription:
         default_value='base_scan',
     )
 
+    # cmd_vel_arbiter 是 /cmd_vel/selected 的唯一 publisher：loopback 与实机、
+    # MuJoCo、Gazebo 共享同一条「执行端只消费 selected」的速度出口契约。
+    # 串口链不存在，require_serial_link 置 False，速度仍须经仲裁。
+    cmd_vel_arbiter_cmd = Node(
+        package='ats_cmd_vel_arbiter',
+        executable='cmd_vel_arbiter_node',
+        name='cmd_vel_arbiter',
+        output='screen',
+        parameters=[{
+            'manual_cmd_vel_topic': '/cmd_vel',
+            'autonomy_cmd_vel_topic': '/cmd_vel/autonomy_raw',
+            'selected_cmd_vel_topic': '/cmd_vel/selected',
+            'require_serial_link': False,
+        }],
+    )
+
     loopback_sim_cmd = Node(
         package='nav2_loopback_sim',
         executable='loopback_simulator',
@@ -30,7 +46,8 @@ def generate_launch_description() -> LaunchDescription:
         output='screen',
         parameters=[{
             'scan_frame_id': scan_frame_id,
-            'command_topic': '/motion_control',
+            'command_topic': '/cmd_vel/selected',
+            'enable_stamped_cmd_vel': False,
             'map_topic': '/map',
         }],
     )
@@ -50,5 +67,6 @@ def generate_launch_description() -> LaunchDescription:
     ld.add_action(declare_scan_frame_id_cmd)
     ld.add_action(declare_map_cmd)
     ld.add_action(static_map)
+    ld.add_action(cmd_vel_arbiter_cmd)
     ld.add_action(loopback_sim_cmd)
     return ld

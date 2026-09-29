@@ -98,13 +98,16 @@ class LoopbackSimulator(Node):
         self.declare_parameter('scan_frame_id', 'base_scan')
         self.scan_frame_id = self.get_parameter('scan_frame_id').get_parameter_value().string_value
 
-        self.declare_parameter('command_topic', '/motion_control')
+        # 速度入口默认与实机执行端一致：cmd_vel_arbiter 是 /cmd_vel/selected
+        # 的唯一 publisher，loopback 只消费 selected，不直接订阅手动 /cmd_vel。
+        self.declare_parameter('command_topic', '/cmd_vel/selected')
         self.command_topic = self.get_parameter('command_topic').get_parameter_value().string_value
 
         self.declare_parameter('map_topic', '/map')
         self.map_topic = self.get_parameter('map_topic').get_parameter_value().string_value
 
-        self.declare_parameter('enable_stamped_cmd_vel', True)
+        # arbiter 发布的是未打戳的 Twist，loopback 不做 stamped 解析。
+        self.declare_parameter('enable_stamped_cmd_vel', False)
         use_stamped = self.get_parameter('enable_stamped_cmd_vel').get_parameter_value().bool_value
 
         self.declare_parameter('scan_publish_dur', 0.1)
