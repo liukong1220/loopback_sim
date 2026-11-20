@@ -27,7 +27,6 @@ setup(
     maintainer_email='steve@opennav.org',
     description='A loopback simulator to replace physics simulation',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'loopback_simulator = nav2_loopback_sim.loopback_simulator:main',
